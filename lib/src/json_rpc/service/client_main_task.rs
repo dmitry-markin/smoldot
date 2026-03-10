@@ -471,7 +471,8 @@ impl ClientMainTask {
                 | methods::MethodCall::transaction_v1_broadcast { .. }
                 | methods::MethodCall::transactionWatch_v1_submitAndWatch { .. }
                 | methods::MethodCall::sudo_network_unstable_watch { .. }
-                | methods::MethodCall::chainHead_v1_follow { .. } => {
+                | methods::MethodCall::chainHead_v1_follow { .. }
+                | methods::MethodCall::bitswap_stream { .. } => {
                     // Subscription starting requests.
 
                     // We must check the maximum number of subscriptions.
@@ -546,6 +547,7 @@ impl ClientMainTask {
                 }
                 | methods::MethodCall::transactionWatch_v1_unwatch { subscription, .. }
                 | methods::MethodCall::sudo_network_unstable_unwatch { subscription, .. }
+                | methods::MethodCall::bitswap_unstream { subscription, .. }
                 | methods::MethodCall::chainHead_v1_unfollow {
                     follow_subscription: subscription,
                     ..
@@ -576,6 +578,9 @@ impl ClientMainTask {
                                     methods::MethodCall::sudo_network_unstable_unwatch {
                                         ..
                                     } => methods::Response::sudo_network_unstable_unwatch(()),
+                                    methods::MethodCall::bitswap_unstream { .. } => {
+                                        methods::Response::bitswap_unstream(true)
+                                    }
                                     methods::MethodCall::chainHead_v1_unfollow { .. } => {
                                         methods::Response::chainHead_v1_unfollow(())
                                     }
@@ -599,6 +604,10 @@ impl ClientMainTask {
                                 }
                                 methods::MethodCall::state_unsubscribeStorage { .. } => {
                                     methods::Response::state_unsubscribeStorage(false)
+                                        .to_json_response(request_id)
+                                }
+                                methods::MethodCall::bitswap_unstream { .. } => {
+                                    methods::Response::bitswap_unstream(false)
                                         .to_json_response(request_id)
                                 }
                                 _ => parse::build_error_response(

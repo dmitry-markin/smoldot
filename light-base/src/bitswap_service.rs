@@ -59,7 +59,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{iter, pin::Pin, str::FromStr, time::Duration};
+use core::{fmt, iter, pin::Pin, str::FromStr, time::Duration};
 use futures_channel::oneshot;
 use futures_lite::FutureExt as _;
 use futures_util::{StreamExt as _, future, stream::FuturesUnordered};
@@ -153,6 +153,40 @@ impl BitswapService {
 
         result_rx.await.unwrap()
     }
+
+    /// Request multiple Bitswap blocks as a batch.
+    ///
+    /// Returns a receiver that yields `(cid_string, result)` pairs as each CID is resolved.
+    /// The CID strings match the input strings.
+    pub async fn bitswap_stream(
+        &self,
+        cids: Vec<String>,
+    ) -> Result<async_channel::Receiver<(String, BitswapStreamResult)>, BitswapStreamError> {
+        let mut parsed_cids = Vec::with_capacity(cids.len());
+        let mut cid_string_map = Vec::with_capacity(cids.len());
+        for cid_str in &cids {
+            let cid =
+                Cid::from_str(cid_str).map_err(|e| BitswapStreamError::CidParsingError {
+                    cid: cid_str.clone(),
+                    error: e,
+                })?;
+            parsed_cids.push(cid.clone());
+            cid_string_map.push((cid, cid_str.clone()));
+        }
+
+        let (result_tx, result_rx) = async_channel::bounded(cids.len().max(1));
+
+        self.messages_tx
+            .send(ToBackground::BitswapStream {
+                cids: parsed_cids,
+                cid_string_map,
+                result_tx,
+            })
+            .await
+            .unwrap();
+
+        Ok(result_rx)
+    }
 }
 
 /// Error by [`BitswapService::bitswap_block`].
@@ -175,6 +209,30 @@ pub enum BitswapBlockError {
     Timeout,
 }
 
+/// Result for individual CIDs within a [`BitswapService::bitswap_stream`] batch request.
+#[derive(Debug, Clone)]
+pub enum BitswapStreamResult {
+    /// Block data was successfully retrieved.
+    Ok(Vec<u8>),
+    /// No peer reported having the block (or block request failed after a positive "have").
+    NotFound,
+    /// Request timed out.
+    Timeout,
+    /// An error occurred (e.g., no peers connected, queue full).
+    Error(String),
+}
+
+/// Error by [`BitswapService::bitswap_stream`].
+#[derive(Debug, derive_more::Display, derive_more::Error, Clone)]
+pub enum BitswapStreamError {
+    /// One of the CIDs failed to parse.
+    #[display("Invalid/unsupported CID \"{cid}\": {error}")]
+    CidParsingError {
+        cid: String,
+        error: cid::ParseError,
+    },
+}
+
 impl From<SendBitswapMessageError> for BitswapBlockError {
     fn from(error: SendBitswapMessageError) -> BitswapBlockError {
         match error {
@@ -188,6 +246,12 @@ enum ToBackground {
     BitswapBlock {
         cid: Cid,
         result_tx: oneshot::Sender<Result<Vec<u8>, BitswapBlockError>>,
+    },
+    BitswapStream {
+        cids: Vec<Cid>,
+        /// Mapping from parsed CID to original string, so results use user-provided CID strings.
+        cid_string_map: Vec<(Cid, String)>,
+        result_tx: async_channel::Sender<(String, BitswapStreamResult)>,
     },
 }
 
@@ -208,19 +272,51 @@ enum RequestStage {
     Block,
 }
 
+/// How to deliver the result for a request.
+enum RequestResultSender {
+    /// Single-CID request from `bitswap_block`.
+    Oneshot(oneshot::Sender<Result<Vec<u8>, BitswapBlockError>>),
+    /// Batch request from `bitswap_stream`. The `String` is the original CID string.
+    Stream {
+        cid_string: String,
+        tx: async_channel::Sender<(String, BitswapStreamResult)>,
+    },
+}
+
+impl fmt::Debug for RequestResultSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RequestResultSender::Oneshot(_) => f.write_str("Oneshot(..)"),
+            RequestResultSender::Stream { cid_string, .. } => {
+                f.debug_struct("Stream")
+                    .field("cid_string", cid_string)
+                    .finish()
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Request<TPlat: PlatformRef> {
-    result_tx: oneshot::Sender<Result<Vec<u8>, BitswapBlockError>>,
+    result_sender: RequestResultSender,
     timeout: TPlat::Instant,
     stage: RequestStage,
     cid: Cid,
 }
 
-type HaveBroadcastResult = (
-    Result<(), SendBitswapMessageError>,
-    Cid,
-    oneshot::Sender<Result<Vec<u8>, BitswapBlockError>>,
-);
+enum HaveBroadcastResult {
+    Single {
+        result: Result<(), SendBitswapMessageError>,
+        cid: Cid,
+        result_tx: oneshot::Sender<Result<Vec<u8>, BitswapBlockError>>,
+    },
+    Batch {
+        result: Result<(), SendBitswapMessageError>,
+        cids: Vec<Cid>,
+        cid_string_map: Vec<(Cid, String)>,
+        result_tx: async_channel::Sender<(String, BitswapStreamResult)>,
+    },
+}
 
 struct BackgroundTask<TPlat: PlatformRef> {
     /// Log target.
@@ -373,36 +469,130 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 // Network service can be back-pressuring, so we run this in the background.
                 task.pending_have_broadcast = Some(Box::pin(async move {
                     let result = network_service.broadcast_bitswap_message(message).await;
-                    (result, cid, result_tx)
+                    HaveBroadcastResult::Single {
+                        result,
+                        cid,
+                        result_tx,
+                    }
                 }));
             }
-            WakeUpReason::HaveBroadcastResult((result, cid, result_tx)) => {
-                // We either succeeded or failed in broadcasting the "have" request.
+            WakeUpReason::Message(ToBackground::BitswapStream {
+                cids,
+                cid_string_map,
+                result_tx,
+            }) => {
+                debug_assert!(task.pending_have_broadcast.is_none());
 
-                if let Err(err) = result {
-                    // The request is not tracked yet, so we just report the failure.
-                    let _ = result_tx.send(Err(err.into()));
-                    continue;
-                }
+                // Build a single batched Have message for all CIDs.
+                let message =
+                    build_bitswap_message(cids.iter(), WantType::Have, false, true);
+                let network_service = task.network_service.clone();
 
-                // Start tracking the request.
-                let request_id = task.allocate_request_id();
-                let timeout = task.platform.now() + Duration::from_secs(10); // TODO: 5? 20?
-
-                task.requests.insert(
-                    request_id,
-                    Request {
+                task.pending_have_broadcast = Some(Box::pin(async move {
+                    let result = network_service.broadcast_bitswap_message(message).await;
+                    HaveBroadcastResult::Batch {
+                        result,
+                        cids,
+                        cid_string_map,
                         result_tx,
-                        timeout: timeout.clone(),
-                        stage: RequestStage::Have,
-                        cid: cid.clone(),
-                    },
-                );
-                task.requests_by_timeout.insert((timeout, request_id));
-                task.requests_by_cid
-                    .entry(cid)
-                    .or_default()
-                    .push_back(request_id);
+                    }
+                }));
+            }
+            WakeUpReason::HaveBroadcastResult(broadcast_result) => {
+                match broadcast_result {
+                    HaveBroadcastResult::Single {
+                        result,
+                        cid,
+                        result_tx,
+                    } => {
+                        if let Err(err) = result {
+                            let _ = result_tx.send(Err(err.into()));
+                            continue;
+                        }
+
+                        let request_id = task.allocate_request_id();
+                        let timeout =
+                            task.platform.now() + Duration::from_secs(10); // TODO: 5? 20?
+
+                        task.requests.insert(
+                            request_id,
+                            Request {
+                                result_sender: RequestResultSender::Oneshot(result_tx),
+                                timeout: timeout.clone(),
+                                stage: RequestStage::Have,
+                                cid: cid.clone(),
+                            },
+                        );
+                        task.requests_by_timeout.insert((timeout, request_id));
+                        task.requests_by_cid
+                            .entry(cid)
+                            .or_default()
+                            .push_back(request_id);
+                    }
+                    HaveBroadcastResult::Batch {
+                        result,
+                        cids,
+                        cid_string_map,
+                        result_tx,
+                    } => {
+                        if let Err(err) = result {
+                            let err_msg = match err {
+                                SendBitswapMessageError::NoConnection => {
+                                    "No Bitswap peers connected".to_owned()
+                                }
+                                SendBitswapMessageError::QueueFull => {
+                                    "Network sending queue is full".to_owned()
+                                }
+                            };
+                            // Report failure for all CIDs in the batch.
+                            for (_, cid_string) in &cid_string_map {
+                                let _ = result_tx
+                                    .try_send((
+                                        cid_string.clone(),
+                                        BitswapStreamResult::Error(err_msg.clone()),
+                                    ));
+                            }
+                            continue;
+                        }
+
+                        // Build a lookup from Cid -> original string.
+                        let mut cid_to_string =
+                            hashbrown::HashMap::<Cid, String>::new();
+                        for (cid, s) in cid_string_map {
+                            cid_to_string.insert(cid, s);
+                        }
+
+                        let timeout =
+                            task.platform.now() + Duration::from_secs(10); // TODO: 5? 20?
+
+                        for cid in cids {
+                            let request_id = task.allocate_request_id();
+                            let cid_string = cid_to_string
+                                .get(&cid)
+                                .cloned()
+                                .unwrap_or_else(|| cid.to_string());
+
+                            task.requests.insert(
+                                request_id,
+                                Request {
+                                    result_sender: RequestResultSender::Stream {
+                                        cid_string,
+                                        tx: result_tx.clone(),
+                                    },
+                                    timeout: timeout.clone(),
+                                    stage: RequestStage::Have,
+                                    cid: cid.clone(),
+                                },
+                            );
+                            task.requests_by_timeout
+                                .insert((timeout.clone(), request_id));
+                            task.requests_by_cid
+                                .entry(cid)
+                                .or_default()
+                                .push_back(request_id);
+                        }
+                    }
+                }
             }
             WakeUpReason::NetworkEvent(BitswapEvent::BitswapMessage { peer_id, message }) => {
                 let message = message.decode();
@@ -497,7 +687,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                 .remove(&(request.timeout, request_id));
                             debug_assert!(_was_in);
 
-                            let _ = request.result_tx.send(Ok(data.to_owned()));
+                            send_result_ok(request.result_sender, data.to_owned());
                         }
                     }
                 }
@@ -509,7 +699,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     // Requests might have timed out while we were waiting for a response from
                     // network service.
                     if let Some(request_ids) = task.requests_by_cid.remove(&cid) {
-                        let err = match err {
+                        let block_err = match err {
                             SendBitswapMessageError::QueueFull => BitswapBlockError::QueueFull,
                             SendBitswapMessageError::NoConnection => {
                                 BitswapBlockError::BlockRequestFailed
@@ -523,7 +713,10 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                                 .remove(&(request.timeout, request_id));
                             debug_assert!(_was_in);
 
-                            let _ = request.result_tx.send(Err(err.clone()));
+                            send_result_err(
+                                request.result_sender,
+                                block_err.clone(),
+                            );
                         }
                     }
                 }
@@ -563,13 +756,46 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         hashbrown::hash_map::Entry::Vacant(_) => unreachable!(),
                     }
 
-                    let _ = request.result_tx.send(Err(BitswapBlockError::Timeout));
+                    send_result_err(request.result_sender, BitswapBlockError::Timeout);
                 }
             }
             WakeUpReason::ForegroundClosed => {
                 // Foreground closed the control channel, end the task.
                 return;
             }
+        }
+    }
+}
+
+/// Send a successful result through the appropriate sender.
+fn send_result_ok(sender: RequestResultSender, data: Vec<u8>) {
+    match sender {
+        RequestResultSender::Oneshot(tx) => {
+            let _ = tx.send(Ok(data));
+        }
+        RequestResultSender::Stream { cid_string, tx } => {
+            let _ = tx.try_send((cid_string, BitswapStreamResult::Ok(data)));
+        }
+    }
+}
+
+/// Send an error result through the appropriate sender.
+fn send_result_err(sender: RequestResultSender, error: BitswapBlockError) {
+    match sender {
+        RequestResultSender::Oneshot(tx) => {
+            let _ = tx.send(Err(error));
+        }
+        RequestResultSender::Stream { cid_string, tx } => {
+            let stream_result = match error {
+                BitswapBlockError::Timeout => BitswapStreamResult::Timeout,
+                BitswapBlockError::NoPeers
+                | BitswapBlockError::BlockRequestFailed
+                | BitswapBlockError::QueueFull => BitswapStreamResult::NotFound,
+                BitswapBlockError::CidParsingError(e) => {
+                    BitswapStreamResult::Error(e.to_string())
+                }
+            };
+            let _ = tx.try_send((cid_string, stream_result));
         }
     }
 }
