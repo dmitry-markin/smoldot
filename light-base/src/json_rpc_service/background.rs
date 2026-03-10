@@ -170,6 +170,10 @@ struct Background<TPlat: PlatformRef> {
     /// unsubscribes.
     transactions_subscriptions: hashbrown::HashMap<String, TransactionWatch, fnv::FnvBuildHasher>,
 
+    /// List of all active `bitswap_stream` subscriptions, indexed by the subscription ID.
+    bitswap_stream_subscriptions:
+        hashbrown::HashMap<String, BitswapStreamSubscription, fnv::FnvBuildHasher>,
+
     /// List of all active `state_subscribeStorage` subscriptions, indexed by the subscription ID.
     /// Values are the list of keys requested by this subscription.
     legacy_api_storage_subscriptions: BTreeSet<(Arc<str>, Vec<u8>)>,
@@ -462,6 +466,15 @@ enum Event<TPlat: PlatformRef> {
         request_id_json: String,
         result: Result<Vec<u8>, bitswap_service::BitswapBlockError>,
     },
+    BitswapStreamEvent {
+        subscription_id: String,
+        cid: String,
+        result: bitswap_service::BitswapStreamResult,
+        result_rx: async_channel::Receiver<(String, bitswap_service::BitswapStreamResult)>,
+    },
+    BitswapStreamComplete {
+        subscription_id: String,
+    },
 }
 
 struct TransactionWatch {
@@ -481,6 +494,12 @@ enum TransactionWatchTy {
     },
     /// `transactionWatch_v1_submitAndWatch`.
     NewApiWatch,
+}
+
+/// State for an active `bitswap_stream` subscription.
+struct BitswapStreamSubscription {
+    /// The set of CIDs that haven't been resolved yet.
+    remaining_cids: hashbrown::HashSet<String, fnv::FnvBuildHasher>,
 }
 
 /// See [`Background::state_get_keys_paged_cache`].
@@ -540,6 +559,7 @@ pub(super) async fn run<TPlat: PlatformRef>(
             Default::default(),
         ),
         chain_head_follow_subscriptions: hashbrown::HashMap::with_hasher(Default::default()),
+        bitswap_stream_subscriptions: hashbrown::HashMap::with_hasher(Default::default()),
         legacy_api_storage_subscriptions: BTreeSet::new(),
         legacy_api_storage_subscriptions_by_key: BTreeSet::new(),
         legacy_api_stale_storage_subscriptions: hashbrown::HashSet::with_capacity_and_hasher(
@@ -851,7 +871,9 @@ pub(super) async fn run<TPlat: PlatformRef>(
                     | methods::MethodCall::sudo_network_unstable_watch { .. }
                     | methods::MethodCall::sudo_network_unstable_unwatch { .. }
                     | methods::MethodCall::chainHead_unstable_finalizedDatabase { .. }
-                    | methods::MethodCall::bitswap_block { .. } => {}
+                    | methods::MethodCall::bitswap_block { .. }
+                    | methods::MethodCall::bitswap_stream { .. }
+                    | methods::MethodCall::bitswap_unstream { .. } => {}
                 }
 
                 // Actual requests handler.
@@ -995,6 +1017,101 @@ pub(super) async fn run<TPlat: PlatformRef>(
                                 }
                             })
                         });
+                    }
+
+                    methods::MethodCall::bitswap_stream { cids } => {
+                        log!(
+                            &me.platform,
+                            Debug,
+                            &me.log_target,
+                            format!(
+                                "Request for Bitswap stream with {} CIDs",
+                                cids.len()
+                            )
+                        );
+
+                        let subscription_id = {
+                            let mut subscription_id = [0u8; 32];
+                            me.randomness.fill_bytes(&mut subscription_id);
+                            bs58::encode(subscription_id).into_string()
+                        };
+
+                        let mut remaining_cids =
+                            hashbrown::HashSet::with_capacity_and_hasher(
+                                cids.len(),
+                                fnv::FnvBuildHasher::default(),
+                            );
+                        for cid_str in &cids {
+                            remaining_cids.insert(cid_str.clone());
+                        }
+
+                        match me.bitswap_service.bitswap_stream(cids).await {
+                            Ok(result_rx) => {
+                                me.bitswap_stream_subscriptions.insert(
+                                    subscription_id.clone(),
+                                    BitswapStreamSubscription { remaining_cids },
+                                );
+
+                                let _ = me
+                                    .responses_tx
+                                    .send(
+                                        methods::Response::bitswap_stream(Cow::Borrowed(
+                                            &subscription_id,
+                                        ))
+                                        .to_json_response(request_id_json),
+                                    )
+                                    .await;
+
+                                // Spawn background task to read the first result.
+                                me.background_tasks.push({
+                                    let subscription_id = subscription_id.clone();
+                                    Box::pin(async move {
+                                        match result_rx.recv().await {
+                                            Ok((cid, result)) => {
+                                                Event::BitswapStreamEvent {
+                                                    subscription_id,
+                                                    cid,
+                                                    result,
+                                                    result_rx,
+                                                }
+                                            }
+                                            Err(_) => {
+                                                Event::BitswapStreamComplete {
+                                                    subscription_id,
+                                                }
+                                            }
+                                        }
+                                    })
+                                });
+                            }
+                            Err(error) => {
+                                let _ = me
+                                    .responses_tx
+                                    .send(parse::build_error_response(
+                                        request_id_json,
+                                        parse::ErrorResponse::ApplicationDefined(
+                                            -32803,
+                                            &error.to_string(),
+                                        ),
+                                        None,
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+
+                    methods::MethodCall::bitswap_unstream { subscription } => {
+                        let existed = me
+                            .bitswap_stream_subscriptions
+                            .remove(&*subscription)
+                            .is_some();
+                        let _ = me
+                            .responses_tx
+                            .send(
+                                methods::Response::bitswap_unstream(existed)
+                                    .to_json_response(request_id_json),
+                            )
+                            .await;
                     }
 
                     methods::MethodCall::chain_getBlock { hash } => {
@@ -5743,6 +5860,80 @@ pub(super) async fn run<TPlat: PlatformRef>(
                     ),
                 };
                 let _ = me.responses_tx.send(response).await;
+            }
+
+            WakeUpReason::Event(Event::BitswapStreamEvent {
+                subscription_id,
+                cid,
+                result,
+                result_rx,
+            }) => {
+                // Check if the subscription is still active (might have been unsubscribed).
+                if let Some(sub) = me.bitswap_stream_subscriptions.get_mut(&subscription_id)
+                {
+                    sub.remaining_cids.remove(&cid);
+
+                    let block_result = match result {
+                        bitswap_service::BitswapStreamResult::Ok(data) => {
+                            methods::BitswapBlockResult::Ok {
+                                data: methods::HexString(data),
+                            }
+                        }
+                        bitswap_service::BitswapStreamResult::NotFound => {
+                            methods::BitswapBlockResult::NotFound
+                        }
+                        bitswap_service::BitswapStreamResult::Timeout => {
+                            methods::BitswapBlockResult::Timeout
+                        }
+                        bitswap_service::BitswapStreamResult::Error(error) => {
+                            methods::BitswapBlockResult::Error { error }
+                        }
+                    };
+
+                    let notification =
+                        methods::ServerToClient::bitswap_streamEvent {
+                            subscription: Cow::Borrowed(&subscription_id),
+                            result: methods::BitswapStreamEvent {
+                                cid,
+                                result: block_result,
+                            },
+                        }
+                        .to_json_request_object_parameters(None);
+
+                    let _ = me.responses_tx.send(notification).await;
+
+                    if sub.remaining_cids.is_empty() {
+                        // All CIDs resolved; clean up the subscription.
+                        me.bitswap_stream_subscriptions.remove(&subscription_id);
+                    } else {
+                        // Re-spawn reader for the next result.
+                        me.background_tasks.push({
+                            let subscription_id = subscription_id.clone();
+                            Box::pin(async move {
+                                match result_rx.recv().await {
+                                    Ok((cid, result)) => Event::BitswapStreamEvent {
+                                        subscription_id,
+                                        cid,
+                                        result,
+                                        result_rx,
+                                    },
+                                    Err(_) => Event::BitswapStreamComplete {
+                                        subscription_id,
+                                    },
+                                }
+                            })
+                        });
+                    }
+                }
+                // If subscription was removed (unsubscribed), we simply drop the event and
+                // don't re-spawn the reader, which will cause result_rx to be dropped.
+            }
+
+            WakeUpReason::Event(Event::BitswapStreamComplete {
+                subscription_id,
+            }) => {
+                // Channel closed — clean up.
+                me.bitswap_stream_subscriptions.remove(&subscription_id);
             }
 
             WakeUpReason::NotifyFinalizedHeads => {

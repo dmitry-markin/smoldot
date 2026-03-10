@@ -524,6 +524,12 @@ define_methods! {
 
     /// Request a data block by its CID from one of the connected peers that have it.
     bitswap_block(cid: String) -> HexString,
+
+    /// Subscribe to batch Bitswap block retrieval for multiple CIDs.
+    /// Returns a subscription ID; per-CID results are streamed as `bitswap_streamEvent` notifications.
+    bitswap_stream(cids: Vec<String>) -> Cow<'a, str>,
+    /// Cancel an active `bitswap_stream` subscription.
+    bitswap_unstream(subscription: Cow<'a, str>) -> bool,
 }
 
 define_methods! {
@@ -543,6 +549,9 @@ define_methods! {
     // This function is a custom addition in smoldot. As of the writing of this comment, there is
     // no plan to standardize it. See https://github.com/paritytech/smoldot/issues/2245.
     sudo_networkState_event(subscription: Cow<'a, str>, result: NetworkEvent) -> (),
+
+    /// Notification for `bitswap_stream` subscriptions, delivering per-CID results.
+    bitswap_streamEvent(subscription: Cow<'a, str>, result: BitswapStreamEvent) -> (),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -909,6 +918,31 @@ pub enum NetworkEventDirection {
     In,
     #[serde(rename = "out")]
     Out,
+}
+
+/// Result for a single CID within a `bitswap_stream` subscription.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum BitswapBlockResult {
+    /// Block data was successfully retrieved.
+    #[serde(rename = "ok")]
+    Ok { data: HexString },
+    /// No peer reported having the block.
+    #[serde(rename = "notFound")]
+    NotFound,
+    /// The request timed out.
+    #[serde(rename = "timeout")]
+    Timeout,
+    /// An error occurred (e.g., no peers connected).
+    #[serde(rename = "error")]
+    Error { error: String },
+}
+
+/// Event sent as a `bitswap_streamEvent` notification for each CID.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BitswapStreamEvent {
+    pub cid: String,
+    pub result: BitswapBlockResult,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
